@@ -1,0 +1,503 @@
+---
+title: "Homework 2"
+author:
+- 'Student Name: ZHOU Tianying '
+- 'Student Number: 20910378'
+date: "2022-11-02"
+output:
+  html_document: 
+    toc: yes
+    theme: readable
+    toc_depth: 2
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+subtitle: Exploration of portfolio packages in R
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Load market data
+
+Import the necessary packages.
+
+```{r message=FALSE, warning=FALSE}
+library(PortfolioAnalytics)
+library(fPortfolio)
+library(PerformanceAnalytics)
+library(ROI)
+library(CVXR)
+library(xts)
+library(ggplot2)
+library(RColorBrewer)
+library(reshape2)
+library(DT)
+library(portfolioBacktest)
+library(timeSeries)
+```
+
+Load data from the `portfolioBacktest` package
+
+```{r message=FALSE, warning=FALSE}
+# dataset10 is used for backtest
+data("dataset10")
+
+# new_data is used for plot the weight clearly
+new_data = dataset10$`dataset 1`
+new_data$adjusted = new_data$adjusted[, 1:10]
+colnames(new_data$adjusted) = substr(colnames(new_data$adjusted), 1, 3)
+```
+
+# 2. Compare portfolio functions
+
+## 2.1 Global Maximum Return Portfolio (GMRP)
+
+-   Own designed portfolio function
+
+    This method is to only invest on the one with the highest return. The portfolio is formulated as:
+
+    $$\mathop {\min }\limits_{w} ={w}^{T}μ$$
+
+$$s.t. \quad 1^{T}w=1,\quad{w}\ge 0$$
+
+```{r}
+
+GMRP <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  mu <- colMeans(X)
+  N <- ncol(prices)
+  w <- rep(0, N)
+  i_max <- which.max(mu)
+  w[i_max] <- 1
+  names(w) <- colnames(X)
+  return(w)
+}
+
+t1 <- proc.time()
+w_GMRP_designed <- GMRP(new_data)
+t2 <- proc.time()
+t_designed <- t2 - t1
+```
+
+-   `PortfolioAnalytics` package
+
+    We can set the objective to be the mean.
+
+```{r}
+t1 <- proc.time()
+GMRP_PortfolioAnalytics <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  portf <- portfolio.spec(assets = colnames(X))
+  portf <- add.constraint(portf, type = "full_investment")
+  portf <- add.constraint(portf, type = "box", min = 0, max = 1)
+  portf <- add.objective(portf, type = "risk", name = "mean")
+  portfolio.GMVP <- optimize.portfolio(X, portfolio = portf, optimize_method = "ROI", trace = TRUE)
+  w <- portfolio.GMVP$weights
+  return(w)
+}
+
+w_GMRP_PortfolioAnalytics <- GMRP_PortfolioAnalytics(new_data)
+t2 <- proc.time()
+t_PortfolioAnalytics <- t2 - t1
+```
+
+-   Compare the allocations of the portfolios
+
+    As expected, the weights are the same clearly.
+
+```{r}
+w_all <- cbind("Own designed" = w_GMRP_designed, 
+               "PortfolioAnalytics" = w_GMRP_PortfolioAnalytics)
+# reshape
+w_all = as.data.frame(w_all)
+w_rownames <- rownames(w_all)
+w_colnames <- colnames(w_all)
+w_all$stocks <- w_rownames
+data_m <- melt(w_all, id.vars = c("stocks"))
+
+# plot the wieghts
+ggplot(data_m, aes(x = stocks, y = value)) + 
+  geom_bar(stat = "identity", position = "dodge", aes(fill = variable)) + 
+  labs(y = "dollars") + 
+  scale_fill_manual(values = brewer.pal(name = "Paired", 3)) +
+  theme_light() + 
+  theme(legend.title = element_blank()) + 
+  theme(legend.text = element_text(size = 5)) + 
+  theme(legend.key.size = unit(10, "pt")) + 
+  ggtitle("GMRP Portfolio allocation of different packages")
+```
+
+As for the program execution time, from the plot we can find that the function we designed is more efficient. During the repeated test of execution time, we found that `GMRP` function executes too fast to calculate, which resulted in the number showing as 0. This may be because the function is so simple that we don't need the package in R.
+
+```{r}
+runtime <- data.frame(Method = c("Own designed", "PortfolioAnalytics"),
+                      Time = c(t_designed[3][[1]], t_PortfolioAnalytics[3][[1]]))
+ggplot(runtime, aes(Method, Time)) + 
+  theme_light() + 
+  geom_bar(stat = "identity", fill = c("#A6CEE3", "#1F78B4"), width = .3) +
+  ggtitle("Cost in computational time of different method - GMRP")
+```
+
+## 2.2 Global Minimum Variance Portfolio (GMVP)
+
+-   Own designed portfolio function
+
+    The GMVP with no shorting is formulated as:
+
+$$\mathop {\min }\limits_{w} ={w}^{T}Σ{w}$$
+
+$$s.t. \quad 1^{T}w=1,\quad{w}\ge 0$$
+
+```{r}
+GMVP <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  N <- ncol(prices)
+  Sigma <- cov(X)
+  w <- Variable(N)
+  prob <- Problem(Minimize(quad_form(w, Sigma)), constraints = list(w >= 0, sum(w) == 1))
+  result <- CVXR::solve(prob)
+  w <- as.vector(result$getValue(w))
+  names(w) <- colnames(Sigma)
+  return(w)
+}
+
+t1 <- proc.time()
+w_GMVP_designed <- GMVP(new_data)
+t2 <- proc.time()
+t_designed <- t2 - t1
+```
+
+-   `fPortfolio` package
+
+    The function `minvariancePortfolio` returns the global minimum risk portfolio.
+
+```{r message=FALSE, warning=FALSE}
+GMVP_fPortfolio <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  R <- timeSeries(X)
+  spec <- portfolioSpec()
+  port <- minvariancePortfolio(R, spec, constraints = "longonly")
+  w <- getWeights(port)
+  return(w)
+}
+
+t1 <- proc.time()
+w_GMVP_fPortfolio <- GMVP_fPortfolio(new_data)
+t2 <- proc.time()
+t_fPortfolio <- t2 - t1
+```
+
+-   `PortfolioAnalytics` package
+
+    When we set the objective to be the variance, the function return the returns the global minimum risk portfolio.
+
+```{r message=FALSE, warning=FALSE}
+GMVP_PortfolioAnalytics <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  portf <- portfolio.spec(assets = colnames(X))
+  portf <- add.constraint(portf, type = "full_investment")
+  portf <- add.constraint(portf, type = "box", min = 0, max = 1)
+  portf <- add.objective(portf, type = "risk", name = "var")
+  portfolio.GMVP <- optimize.portfolio(X, portfolio = portf, optimize_method = "ROI", trace = TRUE)
+  w <- portfolio.GMVP$weights
+  return(w)
+}
+
+t1 <- proc.time()
+w_GMVP_PortfolioAnalytics <- GMVP_PortfolioAnalytics(new_data)
+t2 <- proc.time()
+t_PortfolioAnalytics <- t2 - t1
+```
+
+-   Compare the allocations of the portfolios
+
+    The weights of these methods are same.
+
+```{r}
+w_all <- cbind("Own designed" = w_GMVP_designed, 
+               "fPortfolio"= w_GMVP_fPortfolio, 
+               "PortfolioAnalytics" = w_GMVP_PortfolioAnalytics)
+# reshape
+w_all = as.data.frame(w_all)
+w_rownames <- rownames(w_all)
+w_colnames <- colnames(w_all)
+w_all$stocks <- w_rownames
+data_m <- melt(w_all, id.vars = c("stocks"))
+
+# plot the wieghts
+ggplot(data_m, aes(x = stocks, y = value)) + 
+  geom_bar(stat = "identity", position = "dodge", aes(fill = variable)) + 
+  labs(y = "dollars") + 
+  scale_fill_manual(values = brewer.pal(name = "Paired", 3)) +
+  theme_light() + 
+  theme(legend.title = element_blank()) + 
+  theme(legend.text = element_text(size = 5)) + 
+  theme(legend.key.size = unit(10, "pt")) + 
+  ggtitle("GMVP Portfolio allocation of different packages")
+```
+
+Obviously, the two packages are much more efficient than what we designed.
+
+```{r}
+runtime <- data.frame(Method = c("Own designed", "fPortfolio", "PortfolioAnalytics"),
+                      Time = c(t_designed[3][[1]], t_fPortfolio[3][[1]], t_PortfolioAnalytics[3][[1]]))
+ggplot(runtime, aes(Method, Time)) + 
+  theme_light() + 
+  geom_bar(stat = "identity", fill = c("#A6CEE3", "#1F78B4", "#B2DF8A"), width = .3) +
+  ggtitle("Cost in computational time of different method - GMVP")
+```
+
+## 2.3 Maximum Sharpe Ratio Portfolio (MSRP)
+
+-   Own designed portfolio function
+
+    Via Schaible method, the nonconvex problem can be rewritten in convex form as below:$$\mathop {\min }\limits_\tilde{w} =\tilde{w}^{T}Σ \tilde{w}$$
+
+$$s.t. \quad \tilde{w}^{T}μ=1,\quad\tilde{w}\ge 0$$
+
+Then $w=\tilde w / (1^T \tilde w)$. So we can create function for MSRP:
+
+```{r}
+MSRP <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  N <- ncol(prices)
+  mu <- colMeans(X)
+  Sigma <- cov(X)
+  w <- Variable(N)
+  prob <- Problem(Minimize(quad_form(w, Sigma)), constraints = list(w >= 0, t(mu) %*% w == 1))
+  result <- CVXR::solve(prob)
+  w <- as.vector(result$getValue(w)/sum(result$getValue(w)))
+  names(w) <- colnames(Sigma)
+  return(w)
+}
+
+t1 <- proc.time()
+w_MSRP_designed <- MSRP(new_data)
+t2 <- proc.time()
+t_designed <- t2 - t1
+```
+
+-   `fPortfolio` package
+
+    The function `tangencyPortfolio` returns the portfolio with highest Sharpe ratio.
+
+```{r}
+MSRP_fPortfolio <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  R <- timeSeries(X)
+  spec <- portfolioSpec()
+  port <- tangencyPortfolio(R, spec, constraints = "longonly")
+  w <- getWeights(port)
+  return(w)
+}
+
+t1 <- proc.time()
+w_MSRP_fPortfolio <- MSRP_fPortfolio(new_data)
+t2 <- proc.time()
+t_fPortfolio <- t2 - t1
+```
+
+-   `PortfolioAnalytics` package
+
+    Here let the parameter `maxSR` to be **TRUE**, then we get the portfolio with highest Sharpe ratio.
+
+```{r}
+MSRP_PortfolioAnalytics <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  portf <- portfolio.spec(assets = colnames(X))
+  portf <- add.constraint(portf, type = "full_investment")
+  portf <- add.constraint(portf, type = "long_only")
+  portf <- add.objective(portf, type = "return", name = "mean")
+  portf <- add.objective(portf, type = "risk", name = "StdDev")
+  portf$constraints[[1]]$min_sum = 0.99
+  portf$constraints[[1]]$max_sum = 1.01
+  portfolio.maxSR <- optimize.portfolio(X, portfolio = portf, optimize_method = "ROI", maxSR = TRUE, trace = TRUE)
+  w <- portfolio.maxSR$weights
+  return(w)
+}
+
+t1 <- proc.time()
+w_MSRP_PortfolioAnalytics <- MSRP_PortfolioAnalytics(new_data)
+t2 <- proc.time()
+t_PortfolioAnalytics <- t2 - t1
+```
+
+-   Compare the allocations of the portfolios.
+
+    The weights are also same.
+
+```{r}
+w_all <- cbind("Own designed" = w_MSRP_designed, 
+               "fPortfolio"= w_MSRP_fPortfolio, 
+               "PortfolioAnalytics" = w_MSRP_PortfolioAnalytics)
+# reshape
+w_all = as.data.frame(w_all)
+w_rownames <- rownames(w_all)
+w_colnames <- colnames(w_all)
+w_all$stocks <- w_rownames
+data_m <- melt(w_all, id.vars = c("stocks"))
+
+# plot the wieghts
+ggplot(data_m, aes(x = stocks, y = value)) + 
+  geom_bar(stat = "identity", position = "dodge", aes(fill = variable)) + 
+  labs(y = "dollars") + 
+  scale_fill_manual(values = brewer.pal(name = "Paired", 3))+
+  theme_light() + 
+  theme(legend.title = element_blank()) + 
+  theme(legend.text = element_text(size = 5)) + 
+  theme(legend.key.size = unit(10, "pt")) + 
+  ggtitle("MSRP Portfolio allocation of different packages")
+```
+
+`PortfolioAnalytics` spends lots of time to find the portfolio with max Sharpe ratio. And `fPortfolio` performs well as before.
+
+```{r}
+runtime <- data.frame(Method = c("Own designed", "fPortfolio", "PortfolioAnalytics"),
+                      Time = c(t_designed[3][[1]], t_fPortfolio[3][[1]], t_PortfolioAnalytics[3][[1]]))
+ggplot(runtime, aes(Method, Time)) + 
+  theme_light() + 
+  geom_bar(stat = "identity", fill = c("#A6CEE3", "#1F78B4", "#B2DF8A"), width = .3) +
+  ggtitle("Cost in computational time of different method - MSRP")
+```
+
+# 3. Benchmark portfolios
+
+## 3.1 Equally Weighted Portfolio (EWP)
+
+EWP allocates the capital equally across all the assets:
+
+$$w=\frac{1}{N}\textbf{1}$$
+
+```{r}
+EWP <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  N <- ncol(prices)
+  w <- rep(1/N, N)
+  names(w) <- colnames(prices)
+  return(w)
+}
+w_EWP <- EWP(new_data)
+```
+
+## 3.2 Inverse volatility portfolio (IVP)
+
+The aim of IVP is to control the portfolio risk. The IVP is defined as:
+
+$$w=\frac{σ^{-1}}{1^T σ^{-1}}$$
+
+where $\sigma ^ 2 = Diag(Σ)$
+
+```{r}
+IVP <- function(dataset, ...) {
+  prices <- dataset$adjusted
+  X <- diff(log(prices))[-1]
+  Sigma <- cov(X)
+  sigma <- sqrt(diag(Sigma))
+  w <- 1 / sigma
+  w <- w / sum(w)
+  return(w)
+}
+w_IVP <- IVP(new_data)
+```
+
+Together with the benchmark portfolios, we can compare the allocation of the portfolios.
+
+```{r}
+w_all <- cbind("GMRP" = w_GMRP_designed, 
+               "GMVP" = w_GMVP_designed, 
+               "MSRP" = w_MSRP_designed,
+               "EWP" = w_EWP,
+               "IVP" = w_IVP)
+# reshape
+w_all = as.data.frame(w_all)
+w_rownames <- rownames(w_all)
+w_colnames <- colnames(w_all)
+w_all$stocks <- w_rownames
+data_m <- melt(w_all, id.vars = c("stocks"))
+
+# plot the wieghts
+ggplot(data_m, aes(x = stocks, y = value)) + 
+  geom_bar(stat = "identity", position = "dodge", aes(fill = variable)) + 
+  labs(y = "dollars") + 
+  scale_fill_manual(values = brewer.pal(name = "Paired", 5))+
+  theme_light() + 
+  theme(legend.title = element_blank()) + 
+  theme(legend.text = element_text(size = 5)) + 
+  theme(legend.key.size = unit(10, "pt")) + 
+  ggtitle("Portfolio allocation")
+```
+
+-   Plot the performance (in-sample)
+
+    Since it's the in-sample performance, GMRP and MSRP performs best as expected, while others performs poorly. However, the result may be totally different when we evaluate them in the `portfolioBacktest` , where we will use multiple datasets and evaluate on a rolling-window basis.
+
+```{r}
+prices <- new_data$adjusted
+X <- diff(log(prices))[-1]
+w_all <- cbind("GMRP" = w_GMRP_designed, 
+               "GMVP" = w_GMVP_designed, 
+               "MSRP" = w_MSRP_designed,
+               "EWP" = w_EWP,
+               "IVP" = w_IVP)
+ret_all <- xts(X %*% w_all, index(X))
+
+chart.CumReturns(na.omit(ret_all), main = "Cumulative return of portfolios", 
+                   wealth.index = TRUE, legend.loc = "topleft", colorset = rich10equal)
+```
+
+-   Plot drawdown of portfolios
+
+    The GMRP has the worst drawdown.
+
+```{r}
+chart.Drawdown(ret_all, main = "Drawdown of portfolios", legend.loc = "bottomleft", colorset = rich10equal)
+```
+
+# 4. Backtest the portfolios
+
+We backtest the portfolio designed in Chapter 2 and the benchmarks selected in Chapter 3 using the `dataset10`. Since the weights of methods are the same in Chapter 2, we use the most efficient one (which spends the least time).
+
+```{r message=FALSE, warning=FALSE}
+portfolio_list <- list("GMRP" = GMRP,
+                       "GMVP" = GMVP_PortfolioAnalytics,
+                       "MSRP" = MSRP_fPortfolio,
+                       "EWP" = EWP,
+                       "IVP" = IVP)
+library(portfolioBacktest)
+bt <- portfolioBacktest(portfolio_list, dataset10)
+```
+
+Using the backtest result, we can compare the portfolios via tables and plots. Fisrt we focus on th e Sharpe ratio and max drawdown. Surprisingly, the benchmark portfolios performs well while the GMRP has unsatisfactory performance.
+
+```{r}
+res_summary_median <- backtestSummary(bt)
+summaryBarPlot(res_summary_median, measures = c("Sharpe ratio", "max drawdown"))
+```
+
+From the boxplot, it's clear to compare the performance of different portfolios with Sharpe ratio. For EWP has the highest mean of Sharpe ratio is the highest and also with low variance. We can confirm the good performance of the EWP and the poor performance of the GMRP. The result of GMVP and MSRP are not bad.
+
+```{r}
+backtestBoxPlot(bt, "Sharpe ratio")
+```
+
+The leaderboard of the portfolios show all index of the backtest. We can see the return over turnover (ROT) of EWP and IVP is also significantly high.
+
+Based on my experience, IVP usually performs well in portfolio backtest since it give lower weights to high volatility assets and higher weights to low volatility assets.
+
+For GMRP, it allocates all the budget to the asset with maximum return, which is unwise because past performance is not a guarantee of future performance. Actually, the estimation of $μ$ is not robust since the financial data is always heavy-tailed, and it is also highly sensitive to estimation errors.
+
+As for the GMVP, actually variance is not a good measure of risk in practice. Maybe we should focus on other measures, such as CVaR and VaR. Therefore, it's not surprising that other portfolios perform much better than it.
+
+```{r}
+summaryTable(res_summary_median, type = "DT", order_col = 2, order_dir = "desc")
+```
